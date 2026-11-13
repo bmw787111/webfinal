@@ -1,0 +1,187 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Browser</title>
+<style>
+  :root { --bg:#1e1f22; --tab:#2b2d31; --tab-active:#3a3c42; --text:#e6e6e6; --muted:#9aa0a6; --accent:#6aa3ff; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font-family:system-ui, sans-serif; }
+  body { display:flex; flex-direction:column; }
+  #tabs { display:flex; align-items:flex-end; gap:2px; padding:6px 6px 0; background:var(--bg); overflow-x:auto; }
+  .tab { display:flex; align-items:center; gap:8px; max-width:200px; min-width:110px; padding:7px 10px; border-radius:8px 8px 0 0;
+         background:var(--tab); cursor:pointer; font-size:13px; white-space:nowrap; user-select:none; }
+  .tab.active { background:var(--tab-active); }
+  .tab .title { overflow:hidden; text-overflow:ellipsis; flex:1; }
+  .tab .x { border:0; background:none; color:var(--muted); cursor:pointer; font-size:14px; padding:0 2px; }
+  .tab .x:hover { color:var(--text); }
+  #newtab { background:none; border:0; color:var(--muted); font-size:20px; cursor:pointer; padding:2px 10px; }
+  #bar { display:flex; gap:6px; padding:6px; background:var(--tab-active); align-items:center; }
+  #bar button { background:none; border:0; color:var(--text); font-size:16px; width:32px; height:32px; border-radius:50%; cursor:pointer; }
+  #bar button:hover { background:#4a4d55; }
+  #url { flex:1; height:32px; border-radius:16px; border:1px solid #4a4d55; background:var(--bg); color:var(--text); padding:0 14px; font-size:14px; outline:none; }
+  #url:focus { border-color:var(--accent); }
+  #status { font-size:12px; color:#ff8a80; padding:0 8px; }
+  #frames { flex:1; position:relative; background:#fff; }
+  iframe { position:absolute; inset:0; width:100%; height:100%; border:0; display:none; background:#fff; }
+  iframe.active { display:block; }
+  .home { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:16px; background:var(--bg); }
+  .home.active { display:flex; }
+  .home h1 { font-weight:400; margin:0; }
+  .home p { color:var(--muted); margin:0; }
+</style>
+</head>
+<body>
+  <div id="tabs"><button id="newtab" title="New tab">+</button></div>
+  <div id="bar">
+    <button id="back" title="Back">&#9664;</button>
+    <button id="fwd" title="Forward">&#9654;</button>
+    <button id="reload" title="Reload">&#10227;</button>
+    <button id="homebtn" title="Home">&#8962;</button>
+    <input id="url" placeholder="Search DuckDuckGo or enter a URL" autocomplete="off" spellcheck="false">
+    <span id="status"></span>
+  </div>
+  <div id="frames"></div>
+
+  <script src="baremux/index.js"></script>
+  <script src="uv/uv.bundle.js"></script>
+  <script src="uv/uv.config.js"></script>
+  <script src="register-sw.js"></script>
+  <script src="search.js"></script>
+<script>
+"use strict";
+const SEARCH = "https://duckduckgo.com/?q=%s";
+const tabsEl = document.getElementById("tabs");
+const framesEl = document.getElementById("frames");
+const urlEl = document.getElementById("url");
+const statusEl = document.getElementById("status");
+const connection = new BareMux.BareMuxConnection("/baremux/worker.js");
+const tabs = [];
+let active = null;
+let ready = null;
+
+function setup() {
+  if (!ready) ready = (async () => {
+    await registerSW();
+    const wisp = (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/wisp/";
+    if ((await connection.getTransport()) !== "/epoxy/index.mjs")
+      await connection.setTransport("/epoxy/index.mjs", [{ wisp }]);
+  })().catch(err => { ready = null; throw err; });
+  return ready;
+}
+
+function realUrl(frame) {
+  try {
+    const p = frame.contentWindow.location.pathname + frame.contentWindow.location.search + frame.contentWindow.location.hash;
+    if (p.startsWith(__uv$config.prefix)) return __uv$config.decodeUrl(p.slice(__uv$config.prefix.length));
+  } catch (e) {}
+  return null;
+}
+
+function refreshBar() {
+  if (!active) return;
+  if (document.activeElement !== urlEl) urlEl.value = active.url || "";
+}
+
+function makeTab() {
+  const el = document.createElement("div");
+  el.className = "tab";
+  el.innerHTML = '<span class="title">New Tab</span><button class="x" title="Close">&#10005;</button>';
+  const frame = document.createElement("iframe");
+  const home = document.createElement("div");
+  home.className = "home";
+  home.innerHTML = "<h1>Web Browser</h1><p>Type a URL or search in the bar above.</p>";
+  framesEl.append(frame, home);
+  tabsEl.insertBefore(el, document.getElementById("newtab"));
+  const t = { el, frame, home, url: "" };
+  tabs.push(t);
+  el.addEventListener("click", () => select(t));
+  el.querySelector(".x").addEventListener("click", e => { e.stopPropagation(); closeTab(t); });
+  frame.addEventListener("load", () => {
+    const u = realUrl(frame);
+    if (u) t.url = u;
+    let title = "";
+    try { title = frame.contentDocument.title; } catch (e) {}
+    if (!title && t.url) { try { title = new URL(t.url).hostname; } catch (e) {} }
+    t.el.querySelector(".title").textContent = title || "New Tab";
+    if (t === active) refreshBar();
+  });
+  select(t);
+  showHome(t);
+  urlEl.focus();
+  return t;
+}
+
+function showHome(t) {
+  t.frame.removeAttribute("src");
+  t.url = "";
+  t.el.querySelector(".title").textContent = "New Tab";
+  t.home.classList.add("active");
+  t.frame.classList.remove("active");
+  refreshBar();
+}
+
+function select(t) {
+  for (const x of tabs) {
+    const on = x === t;
+    x.el.classList.toggle("active", on);
+    x.frame.classList.toggle("active", on && !!x.url);
+    x.home.classList.toggle("active", on && !x.url);
+  }
+  active = t;
+  refreshBar();
+}
+
+function closeTab(t) {
+  const i = tabs.indexOf(t);
+  tabs.splice(i, 1);
+  t.el.remove(); t.frame.remove(); t.home.remove();
+  if (!tabs.length) makeTab();
+  else if (active === t) select(tabs[Math.max(0, i - 1)]);
+}
+
+async function go(input) {
+  input = input.trim();
+  if (!input) return;
+  statusEl.textContent = "";
+  try { await setup(); }
+  catch (err) { statusEl.textContent = "Proxy failed to start: " + err.message; console.error(err); return; }
+  const target = search(input, SEARCH);
+  const t = active;
+  t.url = target;
+  t.home.classList.remove("active");
+  t.frame.classList.add("active");
+  try { t.el.querySelector(".title").textContent = new URL(target).hostname; } catch (e) {}
+  t.frame.src = __uv$config.prefix + __uv$config.encodeUrl(target);
+  urlEl.blur();
+  refreshBar();
+}
+
+urlEl.addEventListener("keydown", e => { if (e.key === "Enter") go(urlEl.value); });
+urlEl.addEventListener("focus", () => urlEl.select());
+document.getElementById("newtab").addEventListener("click", makeTab);
+document.getElementById("back").addEventListener("click", () => { try { active.frame.contentWindow.history.back(); } catch (e) {} });
+document.getElementById("fwd").addEventListener("click", () => { try { active.frame.contentWindow.history.forward(); } catch (e) {} });
+document.getElementById("reload").addEventListener("click", () => { try { active.frame.contentWindow.location.reload(); } catch (e) {} });
+document.getElementById("homebtn").addEventListener("click", () => showHome(active));
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "t") { e.preventDefault(); makeTab(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "w") { e.preventDefault(); closeTab(active); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "l") { e.preventDefault(); urlEl.focus(); }
+});
+setInterval(() => {  // keep the address bar in sync with in-page navigation
+  if (active && active.url) { const u = realUrl(active.frame); if (u && u !== active.url) { active.url = u; refreshBar(); } }
+}, 500);
+// Ask before leaving or closing the page. Browsers show their own built-in
+// "Leave site? Changes you made may not be saved." text; custom messages are ignored.
+window.addEventListener("beforeunload", e => {
+  e.preventDefault();
+  e.returnValue = "Are you sure? Unsaved data might be lost.";
+  return e.returnValue;
+});
+makeTab();
+setup().catch(() => {});
+</script>
+</body>
+</html>
